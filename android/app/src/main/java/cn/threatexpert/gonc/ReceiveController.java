@@ -59,8 +59,7 @@ final class ReceiveController {
     private final List<HttpReceiver.RemoteFile> remoteFiles = new ArrayList<>();
     private final Map<String, HttpReceiver.ReceivedTarget> receivedTargets = new LinkedHashMap<>();
     private long receivedTargetCheckId;
-    private boolean receivedCompletionRefreshPending;
-    private long receivedCompletionRefreshToken;
+    private final ReceivedCompletionRefresh completionRefresh = new ReceivedCompletionRefresh();
     private boolean shutdown;
     private final Set<String> selectedRemotePaths = new HashSet<>();
     private final Set<String> excludedRemotePaths = new HashSet<>();
@@ -133,11 +132,11 @@ final class ReceiveController {
     /** True when any receive worker (session, remote listing, or download) is live. */
     boolean isBusy() {
         return receiveSession != null || remoteListSession != null || receiveDownload != null
-                || receivedCompletionRefreshPending;
+                || completionRefresh.isPending();
     }
 
     boolean isDownloading() {
-        return receiveDownload != null || receivedCompletionRefreshPending;
+        return receiveDownload != null || completionRefresh.isPending();
     }
 
     /**
@@ -171,7 +170,7 @@ final class ReceiveController {
 
     void setSaveLocation(Uri uri, String label) {
         if (!ReceivedFileActionState.canStartNewConnection(
-                receiveDownload != null, receivedCompletionRefreshPending)) {
+                receiveDownload != null, completionRefresh.isPending())) {
             return;
         }
         saveTreeUri = uri;
@@ -183,6 +182,7 @@ final class ReceiveController {
     /** Stop every receive worker quietly (no UI/log), e.g. on Activity destroy. */
     void shutdown() {
         shutdown = true;
+        completionRefresh.cancel();
         PassphraseQrView.clearCache();
         receivedTargetCheckId++;
         GoncBridge.Session receive = receiveSession;
@@ -211,6 +211,7 @@ final class ReceiveController {
 
     /** Reset transient state for a fresh launch. */
     void resetForFreshLaunch() {
+        completionRefresh.cancel();
         PassphraseQrView.clearCache();
         receiveUseUdp = false;
         receivePassword = "";
@@ -508,7 +509,7 @@ final class ReceiveController {
         HttpReceiver.ReceivedTarget target = receivedTargets.get(normalizedPath);
         boolean receivedMarkerVisible = ReceivedFileActionState.markerVisible(target != null);
         boolean receivedActionsEnabled = ReceivedFileActionState.actionsEnabled(
-                target != null, receiveDownload != null, receivedCompletionRefreshPending);
+                target != null, receiveDownload != null, completionRefresh.isPending());
         LinearLayout row = row();
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(10), dp(6), dp(10), dp(6));
@@ -698,7 +699,7 @@ final class ReceiveController {
 
     private boolean canUseReceivedFileActions() {
         return !shutdown && ReceivedFileActionState.actionsEnabled(
-                true, receiveDownload != null, receivedCompletionRefreshPending);
+                true, receiveDownload != null, completionRefresh.isPending());
     }
 
     private void refreshReceivedTargets(long runId, String checkedPath) {
@@ -735,25 +736,37 @@ final class ReceiveController {
             Map<String, HttpReceiver.ReceivedTarget> resolved = checked;
             RuntimeException failure = resolutionFailure;
             host.mainHandler().post(() -> {
-                if (!isReceivedTargetCheckCurrent(
-                        runId, checkId, normalizedCheckedPath, checkedTree, checkedSaveLabel)) {
+                if (shutdown || !isCurrentRun(runId)) {
                     return;
                 }
-                if (completionRefreshToken == 0L
-                        && (receiveDownload != null || receivedCompletionRefreshPending)) {
-                    return;
-                }
-                if (failure == null) {
-                    for (HttpReceiver.RemoteFile file : snapshot) {
-                        receivedTargets.remove(normalizeRemotePath(file.path));
+                boolean updated = false;
+                try {
+                    if (!isReceivedTargetCheckCurrent(
+                            runId, checkId, normalizedCheckedPath, checkedTree, checkedSaveLabel)) {
+                        return;
                     }
-                    receivedTargets.putAll(resolved);
+                    if (completionRefreshToken == 0L
+                            && (receiveDownload != null || completionRefresh.isPending())) {
+                        return;
+                    }
+                    if (failure == null) {
+                        for (HttpReceiver.RemoteFile file : snapshot) {
+                            receivedTargets.remove(normalizeRemotePath(file.path));
+                        }
+                        receivedTargets.putAll(resolved);
+                        updated = true;
+                    }
+                } finally {
+                    // Finish ownership even when the directory snapshot is stale.
+                    // Otherwise an obsolete result can leave the module busy forever.
+                    boolean completed = completionRefresh.finish(completionRefreshToken);
+                    if (completed) {
+                        host.refreshForegroundService();
+                    }
+                    if (completed || updated) {
+                        host.requestRender();
+                    }
                 }
-                if (ReceivedFileActionState.ownsCompletionRefresh(
-                        receivedCompletionRefreshToken, completionRefreshToken)) {
-                    receivedCompletionRefreshPending = false;
-                }
-                host.requestRender();
             });
         }, "gonc-received-file-check").start();
     }
@@ -1056,14 +1069,14 @@ final class ReceiveController {
 
     private boolean canClickRemoteAction() {
         return receiveDownload == null
-                && !receivedCompletionRefreshPending
+                && !completionRefresh.isPending()
                 && remoteListSession == null;
     }
 
     private boolean canStartReceiveConnection() {
         return receiveSession == null
                 && ReceivedFileActionState.canStartNewConnection(
-                receiveDownload != null, receivedCompletionRefreshPending);
+                receiveDownload != null, completionRefresh.isPending());
     }
 
     private void browseRemotePath(String path) {
@@ -1518,7 +1531,7 @@ final class ReceiveController {
             receiveDownloadId++;
             receivedTargets.clear();
             receivedTargetCheckId++;
-            receivedCompletionRefreshToken++;
+            completionRefresh.cancel();
         }
         host.refreshForegroundService();
         host.requestRender();
@@ -1888,7 +1901,7 @@ final class ReceiveController {
         if (!ensureDefaultSavePermission()) {
             return;
         }
-        if (receiveDownload != null || receivedCompletionRefreshPending) {
+        if (receiveDownload != null || completionRefresh.isPending()) {
             return;
         }
         receiveEndpoint = endpoint;
@@ -1935,11 +1948,10 @@ final class ReceiveController {
         if (!isCurrentRun(runId) || shutdown
                 || !ReceivedFileActionState.shouldBeginTerminalRefresh(
                 receiveDownloadId, downloadId, receiveDownload != null,
-                receivedCompletionRefreshPending)) {
+                completionRefresh.isPending())) {
             return;
         }
-        long completionRefreshToken = ++receivedCompletionRefreshToken;
-        receivedCompletionRefreshPending = true;
+        long completionRefreshToken = completionRefresh.begin();
         receiveDownload = null;
         synchronized (downloadProgressLock) {
             pendingDownloadProgress = null;

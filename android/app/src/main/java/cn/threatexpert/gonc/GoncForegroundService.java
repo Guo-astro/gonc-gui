@@ -114,6 +114,23 @@ public final class GoncForegroundService extends Service {
         }
     }
 
+    /** Explicit exit: discard module bookkeeping and remove even a stale notification. */
+    static void clear(Context context) {
+        synchronized (LOCK) {
+            STATES.clear();
+            if (instance != null) {
+                instance.shutdown();
+            }
+            NotificationManager manager = context.getApplicationContext()
+                    .getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.cancel(NOTIFICATION_ID);
+            }
+            // A queued service start still enters foreground in onStartCommand,
+            // then sees the empty state and shuts down, satisfying Android's deadline.
+        }
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();

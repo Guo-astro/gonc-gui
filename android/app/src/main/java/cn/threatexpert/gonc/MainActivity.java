@@ -87,6 +87,7 @@ public final class MainActivity extends Activity implements ModuleHost {
     private static final int REQUEST_NOTIFICATION_PERMISSION = 1008;
     private static final int REQUEST_OPEN_SEND_MEDIA = 1009;
     private boolean notificationPermissionRequested;
+    private boolean exiting;
     private static final int MAX_ACTIVITY_LOGS = 500;
     private static final int MAX_VISIBLE_ACTIVITY_LOGS = 80;
     /** Coalescing window for high-frequency background (log/metric) re-renders. */
@@ -222,8 +223,7 @@ public final class MainActivity extends Activity implements ModuleHost {
             showRunningTaskBackDialog();
             return;
         }
-        resetTransientStateForFreshLaunch();
-        finish();
+        endAllTasksAndExit();
     }
 
     private void showRunningTaskBackDialog() {
@@ -326,10 +326,15 @@ public final class MainActivity extends Activity implements ModuleHost {
         // On a config change the controllers are retained, so leave them and
         // their sessions running; only tear down on a real destroy.
         if (!isChangingConfigurations()) {
+            exiting = true;
             vpnClient.unregister();
-            sendController.shutdown();
-            vpnServer.shutdown();
-            receiveController.shutdown();
+            try {
+                sendController.endTask();
+                vpnServer.endTask();
+                receiveController.endTask();
+            } finally {
+                GoncForegroundService.clear(this);
+            }
         }
         super.onDestroy();
     }
@@ -871,6 +876,7 @@ public final class MainActivity extends Activity implements ModuleHost {
     }
 
     private void endAllTasksAndExit() {
+        exiting = true;
         sendController.endTask();
         receiveController.endTask();
         vpnServer.endTask();
@@ -879,7 +885,7 @@ public final class MainActivity extends Activity implements ModuleHost {
         }
 
         resetTransientStateForFreshLaunch();
-        refreshForegroundService();
+        GoncForegroundService.clear(this);
         finish();
     }
 
@@ -1813,6 +1819,10 @@ public final class MainActivity extends Activity implements ModuleHost {
 
     @Override
     public void refreshForegroundService() {
+        if (exiting) {
+            GoncForegroundService.clear(this);
+            return;
+        }
         boolean wasKeepScreenVisible = keepScreenIndicatorVisible;
         updateKeepScreenOn();
         // The VPN client is excluded on purpose: it has its own GoncVpnService.
