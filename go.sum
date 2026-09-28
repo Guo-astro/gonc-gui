@@ -121,6 +121,8 @@ github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWD
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/threatexpert/go-winpty v1.0.3 h1:RVji3LYT4qDHMKnsLeiqRkfJd3WBB/yASUmfDDGhwE4=
 github.com/threatexpert/go-winpty v1.0.3/go.mod h1:gnsSaUlz6zumcKjLreCFuulz+dOzVp/OIZI8r/CuA1c=
+github.com/threatexpert/gonc/v2 v2.6.10 h1:GQdwYxeSLwtJ2vH6W7DPk3FT4twVDeHuMd90KCTkff8=
+github.com/threatexpert/gonc/v2 v2.6.10/go.mod h1:+u8Ik3zc819HjDXCrbwxxkO3XN1Q1kAsqnHB/pptyVs=
 github.com/tjfoc/gmsm v1.4.1 h1:aMe1GlZb+0bLjn+cKTPEvvn9oUEBlJitaZiiBwsbgho=
 github.com/tjfoc/gmsm v1.4.1/go.mod h1:j4INPkHWMrhJb38G+J6W4Tw0AbuN8Thu3PbdVYhVcTE=
 github.com/tkrajina/go-reflector v0.5.8 h1:yPADHrwmUbMq4RGEyaOUpz2H90sRsETNVpjzo3DLVQQ=
