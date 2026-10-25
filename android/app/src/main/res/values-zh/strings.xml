@@ -265,7 +265,12 @@
     <string name="cancel">取消</string>
     <string name="close">关闭</string>
     <string name="scan_prompt">扫描 Gonc 口令二维码</string>
-    <string name="scan_vpn_profile_prompt">扫描 Gonc VPN 配置二维码</string>
+    <string name="scan_vpn_profile_prompt">支持扫描 Gonc 口令或 VPN 配置二维码</string>
+    <string name="toast_vpn_passphrase_scanned">已填入口令</string>
+    <string name="toast_vpn_profile_qr_version">暂不支持此 VPN 配置版本，请更新应用</string>
+    <string name="vpn_profile_import_title">识别到 VPN 配置</string>
+    <string name="vpn_profile_import_action">导入</string>
+    <string name="vpn_profile_import_confirm">名称：%1$s\nDNS：%2$s\n路由：%3$s\n\n请仅导入可信来源的配置，将同时导入口令和高级设置。确认后新增配置，不覆盖已有配置，也不会自动连接。</string>
     <string name="pick_qr_from_album">从相册选择</string>
     <string name="open_with">打开方式</string>
     <string name="share_file">分享</string>

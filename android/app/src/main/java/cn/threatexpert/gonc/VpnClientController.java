@@ -51,7 +51,7 @@ final class VpnClientController {
 
     private static final String KEY_VPN_PROFILES = "vpn_profiles";
     private static final String KEY_SELECTED_VPN_PROFILE = "selected_vpn_profile";
-    private static final String VPN_PROFILE_QR_TYPE = "gonc.vpn.profile";
+    private static final String VPN_PROFILE_QR_TYPE = VpnQrPayload.TYPE;
 
     private ModuleHost host;
     private final List<VpnProfile> profiles = new ArrayList<>();
@@ -701,50 +701,50 @@ final class VpnClientController {
     // --- scan + QR --------------------------------------------------------
 
     private void scanPassphrase() {
-        if (GoncVpnState.isRunning()) {
-            return;
-        }
-        host.scanPassphrase(result -> {
-            if (GoncVpnState.isRunning()) {
-                return;
-            }
-            currentProfile().passphrase = result.trim();
-            host.log("info", "VPN passphrase scanned");
-            host.requestRender();
-        });
+        scanProfile();
     }
 
     private void scanProfile() {
         if (GoncVpnState.isRunning()) {
             return;
         }
-        host.scanProfileQr(this::importProfileFromQr);
+        host.scanProfileQr(this::handleVpnQr);
     }
 
-    private void importProfileFromQr(String value) {
-        try {
-            JSONObject root = new JSONObject(value);
-            if (!VPN_PROFILE_QR_TYPE.equals(root.optString("type"))) {
-                host.toast(R.string.toast_vpn_profile_qr_invalid);
-                return;
-            }
-            JSONObject profileJson = root.optJSONObject("profile");
-            if (profileJson == null) {
-                host.toast(R.string.toast_vpn_profile_qr_invalid);
-                return;
-            }
-            VpnProfile profile = VpnProfile.fromJson(profileJson, host.context());
-            profile.name = importedProfileName(profile.displayName(host.context()));
-            profiles.add(profile);
-            selectedIndex = profiles.size() - 1;
+    private void handleVpnQr(String value) {
+        if (GoncVpnState.isRunning()) return;
+        VpnQrPayload payload = VpnQrPayload.parse(value);
+        if (payload.kind == VpnQrPayload.Kind.PASSPHRASE) {
+            currentProfile().passphrase = payload.passphrase;
             passwordVisible = false;
             saveProfiles();
-            host.log("info", "VPN profile imported: " + profile.displayName(host.context()));
-            Toast.makeText(host.context(), string(R.string.toast_vpn_profile_imported, profile.displayName(host.context())), Toast.LENGTH_SHORT).show();
+            host.log("info", "VPN passphrase scanned");
+            host.toast(R.string.toast_vpn_passphrase_scanned);
             host.requestRender();
-        } catch (JSONException error) {
-            host.toast(R.string.toast_vpn_profile_qr_invalid);
+            return;
         }
+        if (payload.kind != VpnQrPayload.Kind.PROFILE) {
+            host.toast(payload.kind == VpnQrPayload.Kind.UNSUPPORTED_VERSION
+                    ? R.string.toast_vpn_profile_qr_version : R.string.toast_vpn_profile_qr_invalid);
+            return;
+        }
+        VpnProfile profile = VpnProfile.fromJson(payload.profile, host.context());
+        new AlertDialog.Builder(host.context())
+                .setTitle(R.string.vpn_profile_import_title)
+                .setMessage(string(R.string.vpn_profile_import_confirm,
+                        profile.displayName(host.context()), profile.dnsServers, profile.routeCidrs))
+                .setNegativeButton(R.string.cancel, null)
+                .setPositiveButton(R.string.vpn_profile_import_action, (dialog, which) -> {
+                    if (GoncVpnState.isRunning()) return;
+                    profile.name = importedProfileName(profile.displayName(host.context()));
+                    profiles.add(profile);
+                    selectedIndex = profiles.size() - 1;
+                    passwordVisible = false;
+                    saveProfiles();
+                    host.log("info", "VPN profile imported: " + profile.displayName(host.context()));
+                    Toast.makeText(host.context(), string(R.string.toast_vpn_profile_imported, profile.displayName(host.context())), Toast.LENGTH_SHORT).show();
+                    host.requestRender();
+                }).show();
     }
 
     private void showProfileQr() {

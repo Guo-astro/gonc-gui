@@ -1389,6 +1389,12 @@ final class HttpReceiver {
         }
 
         private long queryModifiedMs(Uri uri) {
+            // MediaStore is not a DocumentsProvider: querying last_modified throws
+            // across Binder for every received file on Android 10/Huawei devices.
+            if (MediaStore.AUTHORITY.equals(uri.getAuthority())) {
+                long seconds = queryLongColumn(uri, MediaStore.MediaColumns.DATE_MODIFIED);
+                return seconds > 0 ? seconds * 1000L : 0;
+            }
             long documentMs = queryLongColumn(uri, DocumentsContract.Document.COLUMN_LAST_MODIFIED);
             if (documentMs > 0) {
                 return documentMs;

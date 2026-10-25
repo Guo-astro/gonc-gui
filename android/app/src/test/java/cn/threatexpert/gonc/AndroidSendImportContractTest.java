@@ -77,6 +77,7 @@ public class AndroidSendImportContractTest {
     }
 
     private static String read(String path) throws Exception {
-        return new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8);
+        return new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8)
+                .replace("\r\n", "\n");
     }
 }

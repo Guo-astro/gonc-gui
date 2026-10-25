@@ -272,7 +272,12 @@
     <string name="cancel">Cancel</string>
     <string name="close">Close</string>
     <string name="scan_prompt">Scan Gonc passphrase QR</string>
-    <string name="scan_vpn_profile_prompt">Scan Gonc VPN profile QR</string>
+    <string name="scan_vpn_profile_prompt">Scan a Gonc passphrase or VPN profile QR code</string>
+    <string name="toast_vpn_passphrase_scanned">Passphrase filled in</string>
+    <string name="toast_vpn_profile_qr_version">Unsupported VPN profile version. Please update the app.</string>
+    <string name="vpn_profile_import_title">VPN profile detected</string>
+    <string name="vpn_profile_import_action">Import</string>
+    <string name="vpn_profile_import_confirm">Name: %1$s\nDNS: %2$s\nRoutes: %3$s\n\nOnly import profiles from a trusted source. This also imports the passphrase and advanced settings. A new profile will be added without replacing existing profiles or connecting automatically.</string>
     <string name="pick_qr_from_album">Choose from album</string>
     <string name="open_with">Open with</string>
     <string name="share_file">Share</string>
