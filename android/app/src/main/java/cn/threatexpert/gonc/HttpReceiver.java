@@ -23,6 +23,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -37,6 +38,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.zip.GZIPInputStream;
 
 import com.github.luben.zstd.ZstdInputStream;
@@ -61,6 +65,7 @@ final class HttpReceiver {
     }
 
     interface Callback {
+        default void onDiagnostic(String message) { }
         void onProgress(int doneFiles, int totalFiles, long doneBytes, long totalBytes, long networkBytes, double bytesPerSecond, String current);
 
         void onComplete(int totalFiles, long doneBytes, long totalBytes, long networkBytes, int skippedFiles, int resumedFiles, List<DownloadFailure> failures);
@@ -111,10 +116,15 @@ final class HttpReceiver {
     }
 
     static Session start(Context context, String serverUrl, Uri saveTreeUri, List<RemoteFile> requestedFiles, boolean resume, Callback callback) {
+        return start(context, serverUrl, saveTreeUri, requestedFiles, resume, 4, callback);
+    }
+
+    // Internal 1/2/4-worker entry point for controlled comparisons; never exceeds four.
+    static Session start(Context context, String serverUrl, Uri saveTreeUri, List<RemoteFile> requestedFiles, boolean resume, int concurrency, Callback callback) {
         Session session = new Session();
         Thread worker = new Thread(() -> {
             try {
-                run(context.getApplicationContext(), serverUrl, saveTreeUri, requestedFiles, resume, session, callback);
+                run(context.getApplicationContext(), serverUrl, saveTreeUri, requestedFiles, resume, concurrency, session, callback);
             } finally {
                 session.markTerminated();
             }
@@ -143,71 +153,117 @@ final class HttpReceiver {
         return found;
     }
 
-    private static void run(Context context, String serverUrl, Uri saveTreeUri, List<RemoteFile> requestedFiles, boolean resume, Session session, Callback callback) {
+    private static void run(Context context, String serverUrl, Uri saveTreeUri, List<RemoteFile> requestedFiles, boolean resume, int concurrency, Session session, Callback callback) {
+        int workers = Math.max(1, Math.min(ReceiveWorkerPool.MAX_WORKERS, concurrency));
         try {
             List<RemoteFile> files = requestedFiles == null ? dropRootDirectories(list(serverUrl, "", session).files) : new ArrayList<>(requestedFiles);
-            long totalBytes = 0;
-            int totalFiles = 0;
-            for (RemoteFile file : files) {
-                if (!file.isDir) {
-                    totalFiles++;
-                    totalBytes += Math.max(0, file.size);
-                }
-            }
-
-            int doneFiles = 0;
-            long doneBytes = 0;
-            long networkDoneBytes = 0;
-            int skippedFiles = 0;
-            int resumedFiles = 0;
-            List<DownloadFailure> failures = new ArrayList<>();
-            ProgressClock clock = new ProgressClock();
+            List<RemoteFile> jobs = new ArrayList<>();
+            Set<String> paths = new HashSet<>();
             TargetResolver targetResolver = new TargetResolver(context, saveTreeUri);
-            if (callback != null) {
-                callback.onProgress(0, totalFiles, 0, totalBytes, 0, 0, "");
-            }
             for (RemoteFile file : files) {
-                if (session.isStopped()) {
-                    return;
-                }
+                checkStopped(session);
                 if (file.isDir) {
                     targetResolver.ensureDirectory(file.path);
-                    continue;
-                }
-                DownloadResult result;
-                try {
-                    result = downloadOne(context, serverUrl, file, targetResolver, resume, session, callback, clock, doneFiles, totalFiles, doneBytes, networkDoneBytes, totalBytes);
-                } catch (Throwable error) {
-                    if (session.isStopped()) {
-                        return;
-                    }
-                    doneFiles++;
-                    failures.add(new DownloadFailure(file.path, errorMessage(error)));
-                    if (callback != null) {
-                        callback.onProgress(doneFiles, totalFiles, doneBytes, totalBytes, networkDoneBytes, clock.speedFor(networkDoneBytes), file.path);
-                    }
-                    continue;
-                }
-                doneFiles++;
-                doneBytes += result.doneBytes;
-                networkDoneBytes += result.networkBytes;
-                if (result.skipped) {
-                    skippedFiles++;
-                }
-                if (result.resumed) {
-                    resumedFiles++;
-                }
-                if (callback != null) {
-                    callback.onProgress(doneFiles, totalFiles, doneBytes, totalBytes, networkDoneBytes, clock.speedFor(networkDoneBytes), file.path);
+                } else if (paths.add(normalizePath(file.path))) {
+                    // Repair can update metadata: keep it private to this download worker.
+                    RemoteFile copy = new RemoteFile();
+                    copy.path = file.path;
+                    copy.name = file.name;
+                    copy.size = file.size;
+                    copy.modifiedMs = file.modifiedMs;
+                    jobs.add(copy);
                 }
             }
+            workers = Math.min(workers, Math.max(1, jobs.size()));
+            if (callback != null && !session.isStopped()) callback.onDiagnostic("Receive workers=" + workers);
+            BatchProgress batch = new BatchProgress(jobs, session, callback);
+            batch.emit("", true);
+            ReceiveWorkerPool.run(jobs.size(), workers, session, index -> {
+                RemoteFile file = jobs.get(index);
+                ProgressClock clock = new ProgressClock();
+                Callback fileCallback = new Callback() {
+                    @Override public void onProgress(int doneFiles, int totalFiles, long bytes, long total,
+                                                     long network, double speed, String current) {
+                        batch.update(index, file, bytes, clock.networkBytes);
+                    }
+                    @Override public void onComplete(int totalFiles, long doneBytes, long totalBytes,
+                                                     long networkBytes, int skipped, int resumed, List<DownloadFailure> failures) { }
+                    @Override public void onError(Throwable error) { }
+                };
+                long started = System.nanoTime();
+                try {
+                    checkStopped(session);
+                    DownloadResult result = downloadOne(context, serverUrl, file, targetResolver, resume, session,
+                            fileCallback, clock, 0, jobs.size(), 0, 0, Math.max(0, file.size));
+                    if (!session.isStopped()) batch.finish(index, file, result.doneBytes, clock.networkBytes,
+                            result.skipped, result.resumed, null);
+                } catch (Throwable error) {
+                    if (!session.isStopped()) batch.finish(index, file, clock.logicalBytes, clock.networkBytes,
+                            false, false, new DownloadFailure(file.path, errorMessage(error)));
+                } finally {
+                    session.timings.record("file", started);
+                }
+            });
+            batch.emit("", true);
             if (callback != null && !session.isStopped()) {
-                callback.onComplete(totalFiles, doneBytes, totalBytes, networkDoneBytes, skippedFiles, resumedFiles, failures);
+                ReceiveProgress.Snapshot result = batch.progress.snapshot();
+                callback.onComplete(result.totalFiles, result.doneBytes, result.totalBytes, result.networkBytes,
+                        result.skippedFiles, result.resumedFiles, new ArrayList<>(batch.failures));
             }
         } catch (Throwable error) {
             if (callback != null && !session.isStopped()) {
                 callback.onError(error);
             }
+        } finally {
+            String summary = session.timings.summary(workers);
+            Log.i(TAG, summary);
+            if (callback != null) callback.onDiagnostic(summary);
+        }
+    }
+
+    private static void checkStopped(Session session) throws InterruptedIOException {
+        if (session.isStopped() || Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Receive stopped");
+    }
+
+    private static final class BatchProgress {
+        final ReceiveProgress progress;
+        final List<DownloadFailure> failures = new ArrayList<>();
+        private final Session session;
+        private final Callback callback;
+        private long lastEmit = System.nanoTime();
+        private long lastNetwork;
+        private double speed;
+
+        BatchProgress(List<RemoteFile> files, Session session, Callback callback) {
+            long[] sizes = new long[files.size()];
+            for (int i = 0; i < sizes.length; i++) sizes[i] = files.get(i).size;
+            progress = new ReceiveProgress(sizes);
+            this.session = session;
+            this.callback = callback;
+        }
+
+        synchronized void update(int index, RemoteFile file, long bytes, long network) {
+            progress.update(index, bytes, network, file.size);
+            emit(file.path, false);
+        }
+
+        synchronized void finish(int index, RemoteFile file, long bytes, long network,
+                                 boolean skipped, boolean resumed, DownloadFailure failure) {
+            progress.finish(index, bytes, network, file.size, skipped, resumed, failure != null);
+            if (failure != null) failures.add(failure);
+            emit(file.path, false);
+        }
+
+        synchronized void emit(String current, boolean force) {
+            if (callback == null || session.isStopped()) return;
+            long now = System.nanoTime();
+            long elapsed = now - lastEmit;
+            if (!force && elapsed < 200_000_000L) return;
+            ReceiveProgress.Snapshot s = progress.snapshot();
+            if (elapsed > 0) speed = Math.max(0, (s.networkBytes - lastNetwork) * 1_000_000_000.0 / elapsed);
+            lastEmit = now;
+            lastNetwork = s.networkBytes;
+            callback.onProgress(s.doneFiles, s.totalFiles, s.doneBytes, s.totalBytes, s.networkBytes, speed, current);
         }
     }
 
@@ -249,42 +305,39 @@ final class HttpReceiver {
 
     private static ListResult list(String serverUrl, String subPath, Session session) throws Exception {
         HttpURLConnection conn = open(resolveUrl(serverUrl, subPath));
-        conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Accept-Encoding", "zstd, gzip");
-        if (conn.getResponseCode() == HttpURLConnection.HTTP_NOT_FOUND) {
-            return new ListResult(new ArrayList<>(), true);
-        }
-        if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
-            throw new IllegalStateException("Remote list failed: HTTP " + conn.getResponseCode());
-        }
-        List<RemoteFile> files = new ArrayList<>();
-        try (InputStream input = decodedInputStream(conn, false);
-             BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (session.isStopped()) {
-                    return new ListResult(files, false);
-                }
-                line = line.trim();
-                if (line.isEmpty()) {
-                    continue;
-                }
-                JSONObject json = new JSONObject(line);
-                RemoteFile file = new RemoteFile();
-                file.name = json.optString("name");
-                file.isDir = json.optBoolean("is_dir");
-                file.size = json.optLong("size");
-                file.path = json.optString("path");
-                file.modifiedMs = parseModTime(json.optString("mod_time"));
-                if (file.path == null || file.path.trim().isEmpty()) {
-                    file.path = file.name;
-                }
-                files.add(file);
+        session.attach(conn);
+        try {
+            checkStopped(session);
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setRequestProperty("Accept-Encoding", "zstd, gzip");
+            int status = conn.getResponseCode();
+            if (status == HttpURLConnection.HTTP_NOT_FOUND) return new ListResult(new ArrayList<>(), true);
+            if (status != HttpURLConnection.HTTP_OK) {
+                throw new IllegalStateException("Remote list failed: HTTP " + status);
             }
+            List<RemoteFile> files = new ArrayList<>();
+            try (InputStream input = decodedInputStream(conn, false);
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    checkStopped(session);
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    JSONObject json = new JSONObject(line);
+                    RemoteFile file = new RemoteFile();
+                    file.name = json.optString("name");
+                    file.isDir = json.optBoolean("is_dir");
+                    file.size = json.optLong("size");
+                    file.path = json.optString("path");
+                    file.modifiedMs = parseModTime(json.optString("mod_time"));
+                    if (file.path == null || file.path.trim().isEmpty()) file.path = file.name;
+                    files.add(file);
+                }
+            }
+            return new ListResult(files, false);
         } finally {
-            conn.disconnect();
+            session.detach(conn);
         }
-        return new ListResult(files, false);
     }
 
     /** Parse the server's RFC3339 {@code mod_time} into epoch millis; 0 when absent/zero/unparseable. */
@@ -316,17 +369,31 @@ final class HttpReceiver {
     }
 
     private static DownloadResult downloadOne(Context context, String serverUrl, RemoteFile file, TargetResolver targetResolver, boolean resume, Session session, Callback callback, ProgressClock clock, int doneFiles, int totalFiles, long baseDoneBytes, long baseNetworkBytes, long totalBytes) throws Exception {
-        DocumentInfo target = targetResolver.ensureFile(file.path, file.name, !resume);
+        long started = System.nanoTime();
+        DocumentInfo target;
+        try {
+            target = targetResolver.ensureFile(file.path, file.name, !resume, session);
+        } finally {
+            session.timings.record("target", started);
+        }
+        checkStopped(session);
         String downloadUrl = resolveUrl(serverUrl, file.path);
         if (resume && target.size == file.size && file.size >= 0 && target.modifiedMs > 0 && file.modifiedMs > 0 && target.modifiedMs == file.modifiedMs) {
             return new DownloadResult(file.size, 0, true, false);
         }
 
         if (resume && target.size > 0) {
-            DownloadResult repaired = tryRepair(context, downloadUrl, file, target, session, callback, clock, doneFiles, totalFiles, baseDoneBytes, baseNetworkBytes, totalBytes);
+            started = System.nanoTime();
+            DownloadResult repaired;
+            try {
+                repaired = tryRepair(context, downloadUrl, file, target, session, callback, clock, doneFiles, totalFiles, baseDoneBytes, baseNetworkBytes, totalBytes);
+            } finally {
+                session.timings.record("repair", started);
+            }
             if (repaired != null) {
                 return repaired;
             }
+            checkStopped(session);
             Log.i(TAG, "BLAKE3 repair unavailable or inefficient for " + file.path + "; re-downloading full file");
         }
 
@@ -338,37 +405,72 @@ final class HttpReceiver {
         session.attach(conn);
         conn.setRequestProperty("Accept-Encoding", "zstd, gzip");
         try {
-            int status = conn.getResponseCode();
+            checkStopped(session);
+            long started = System.nanoTime();
+            int status;
+            try {
+                status = conn.getResponseCode();
+            } finally {
+                session.timings.record("headers", started);
+            }
             if (status != HttpURLConnection.HTTP_OK) {
                 throw new IllegalStateException("Download failed for " + file.path + ": HTTP " + status);
             }
 
             long copied = 0;
             ContentResolver resolver = context.getContentResolver();
-            try (InputStream input = decodedInputStream(conn, false); OutputStream output = resolver.openOutputStream(target.uri, "wt")) {
+            checkStopped(session);
+            started = System.nanoTime();
+            try (InputStream input = decodedInputStream(conn, false); OutputStream output = openTargetOutput(resolver, target.uri, session)) {
                 if (output == null) {
                     throw new IllegalStateException("Cannot open destination: " + file.path);
                 }
+                clock.logicalBytes = 0;
+                if (callback != null) callback.onProgress(doneFiles, totalFiles, baseDoneBytes, totalBytes,
+                        clock.networkBytes, clock.speedFor(clock.networkBytes), file.path);
                 byte[] buffer = new byte[128 * 1024];
                 int n;
                 while ((n = input.read(buffer)) >= 0) {
-                    if (session.isStopped()) {
-                        return new DownloadResult(copied, copied, false, false);
-                    }
+                    checkStopped(session);
+                    clock.networkBytes += n;
                     output.write(buffer, 0, n);
                     copied += n;
-                    if (callback != null && clock.shouldEmit(baseNetworkBytes + copied)) {
-                        callback.onProgress(doneFiles, totalFiles, baseDoneBytes + copied, totalBytes, baseNetworkBytes + copied, clock.speedFor(baseNetworkBytes + copied), file.path);
+                    clock.logicalBytes = copied;
+                    if (callback != null && clock.shouldEmit(clock.networkBytes)) {
+                        callback.onProgress(doneFiles, totalFiles, baseDoneBytes + copied, totalBytes, clock.networkBytes, clock.speedFor(clock.networkBytes), file.path);
                     }
                 }
+            } finally {
+                session.timings.record("bodyAndSave", started);
             }
             if (file.size >= 0 && copied != file.size) {
                 throw new IllegalStateException("Downloaded size mismatch for " + file.path + ": got " + copied + ", expected " + file.size);
             }
-            setTargetModifiedMs(context, target.uri, file.modifiedMs, file.path);
-            return new DownloadResult(copied, copied, false, false);
+            if (file.size < 0) file.size = copied;
+            checkStopped(session);
+            setTargetModifiedTimed(context, target.uri, file.modifiedMs, file.path, session);
+            return new DownloadResult(copied, clock.networkBytes, false, false);
         } finally {
             session.detach(conn);
+        }
+    }
+
+    private static OutputStream openTargetOutput(ContentResolver resolver, Uri uri, Session session) throws Exception {
+        long started = System.nanoTime();
+        try {
+            checkStopped(session);
+            return resolver.openOutputStream(uri, "wt");
+        } finally {
+            session.timings.record("openOutput", started);
+        }
+    }
+
+    private static void setTargetModifiedTimed(Context context, Uri uri, long modifiedMs, String label, Session session) {
+        long started = System.nanoTime();
+        try {
+            setTargetModifiedMs(context, uri, modifiedMs, label);
+        } finally {
+            session.timings.record("modified", started);
         }
     }
 
@@ -435,6 +537,7 @@ final class HttpReceiver {
         }
 
         long keptBytes = Math.max(0, manifest.size - plan.transferBytes);
+        clock.logicalBytes = keptBytes;
         if (callback != null && keptBytes > 0) {
             callback.onProgress(doneFiles, totalFiles, baseDoneBytes + keptBytes, totalBytes, baseNetworkBytes, clock.speedFor(baseNetworkBytes), file.path);
         }
@@ -451,12 +554,15 @@ final class HttpReceiver {
             }
             try (FileOutputStream stream = new FileOutputStream(pfd.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
                 for (RepairRange range : plan.ranges) {
+                    checkStopped(session);
                     long written = downloadRange(downloadUrl, file, range, channel, session, callback, clock, doneFiles, totalFiles, baseDoneBytes + keptBytes, baseNetworkBytes, totalBytes, downloaded);
                     downloaded += written;
                 }
+                checkStopped(session);
                 channel.truncate(manifest.size);
             }
         } catch (Exception error) {
+            checkStopped(session);
             Log.i(TAG, "Range repair unavailable for " + file.path + ": " + error.getMessage());
             return null;
         }
@@ -464,9 +570,10 @@ final class HttpReceiver {
         if (callback != null) {
             callback.onProgress(doneFiles, totalFiles, baseDoneBytes + manifest.size, totalBytes, baseNetworkBytes + downloaded, clock.speedFor(baseNetworkBytes + downloaded), file.path);
         }
-        setTargetModifiedMs(context, target.uri, manifest.modifiedMs, file.path);
+        checkStopped(session);
+        setTargetModifiedTimed(context, target.uri, manifest.modifiedMs, file.path, session);
         Log.i(TAG, "Repair completed for " + file.path + ": " + plan.ranges.size() + " range request(s), downloaded " + formatBytes(downloaded));
-        return new DownloadResult(manifest.size, downloaded, downloaded == 0, downloaded > 0);
+        return new DownloadResult(manifest.size, clock.networkBytes, downloaded == 0, downloaded > 0);
     }
 
     private static void setTargetModifiedMs(Context context, Uri uri, long modifiedMs, String label) {
@@ -484,6 +591,13 @@ final class HttpReceiver {
         }
 
         ContentResolver resolver = context.getContentResolver();
+        if (MediaStore.AUTHORITY.equals(uri.getAuthority())) {
+            // Downloads/MediaStore uses seconds; do not first attempt the DocumentsProvider column.
+            if (!tryUpdateModifiedMs(resolver, uri, MediaStore.MediaColumns.DATE_MODIFIED, modifiedMs / 1000L)) {
+                Log.i(TAG, "Could not set modified time for " + label + " on " + uri);
+            }
+            return;
+        }
         if (tryUpdateModifiedMs(resolver, uri, DocumentsContract.Document.COLUMN_LAST_MODIFIED, modifiedMs)) {
             return;
         }
@@ -514,6 +628,7 @@ final class HttpReceiver {
         conn.setRequestProperty("Accept", "application/json");
         conn.setRequestProperty("Accept-Encoding", "zstd, gzip");
         try {
+            checkStopped(session);
             if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
                 return null;
             }
@@ -652,6 +767,7 @@ final class HttpReceiver {
             long offset = 0;
             int index = 0;
             while (offset < fileSize) {
+                if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Receive stopped while hashing");
                 int want = (int) Math.min(blockSize, fileSize - offset);
                 int got = readFully(input, buffer, want);
                 if (got != want) {
@@ -676,6 +792,7 @@ final class HttpReceiver {
     private static int readFully(InputStream input, byte[] buffer, int want) throws Exception {
         int total = 0;
         while (total < want) {
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Receive stopped while reading");
             int n = input.read(buffer, total, want - total);
             if (n < 0) {
                 break;
@@ -691,6 +808,7 @@ final class HttpReceiver {
         conn.setRequestProperty("Range", "bytes=" + range.offset + "-" + range.endInclusive());
         conn.setRequestProperty("Accept-Encoding", "zstd, gzip");
         try {
+            checkStopped(session);
             if (conn.getResponseCode() != HttpURLConnection.HTTP_PARTIAL) {
                 throw new IllegalStateException("Range request unsupported: HTTP " + conn.getResponseCode());
             }
@@ -700,15 +818,19 @@ final class HttpReceiver {
             try (InputStream input = decodedInputStream(conn, true)) {
                 int n;
                 while ((n = input.read(buffer)) >= 0) {
-                    if (session.isStopped()) {
-                        return written;
+                    checkStopped(session);
+                    clock.networkBytes += n;
+                    ByteBuffer chunk = ByteBuffer.wrap(buffer, 0, n);
+                    while (chunk.hasRemaining()) {
+                        checkStopped(session);
+                        channel.write(chunk);
                     }
-                    channel.write(ByteBuffer.wrap(buffer, 0, n));
                     written += n;
-                    if (callback != null && clock.shouldEmit(baseNetworkBytes + alreadyDownloaded + written)) {
+                    clock.logicalBytes = baseDoneBytes + alreadyDownloaded + written;
+                    if (callback != null && clock.shouldEmit(clock.networkBytes)) {
                         callback.onProgress(doneFiles, totalFiles, baseDoneBytes + alreadyDownloaded + written, totalBytes,
-                                baseNetworkBytes + alreadyDownloaded + written,
-                                clock.speedFor(baseNetworkBytes + alreadyDownloaded + written), file.path);
+                                clock.networkBytes,
+                                clock.speedFor(clock.networkBytes), file.path);
                     }
                 }
             }
@@ -1111,6 +1233,7 @@ final class HttpReceiver {
         private final Map<String, Uri> treeDirectoryCache = new LinkedHashMap<>();
         private final Map<String, Map<String, DocumentInfo>> treeChildrenCache = new LinkedHashMap<>();
         private final Map<String, Map<String, DocumentInfo>> publicFilesCache = new LinkedHashMap<>();
+        private final ReceiveTargetClaims claims = new ReceiveTargetClaims();
 
         TargetResolver(Context context, Uri treeUri) {
             this.context = context;
@@ -1292,7 +1415,22 @@ final class HttpReceiver {
             return 0;
         }
 
-        DocumentInfo ensureFile(String remotePath, String fallbackName, boolean replaceExisting) throws Exception {
+        synchronized DocumentInfo ensureFile(String remotePath, String fallbackName, boolean replaceExisting, Session session) throws Exception {
+            checkStopped(session);
+            String[] parts = pathParts(remotePath);
+            String destination = parts.length == 0 ? safeName(fallbackName) : String.join("/", parts);
+            // Conservative for providers backed by case-insensitive storage.
+            claims.claimPath(destination.toLowerCase(Locale.ROOT), remotePath);
+            DocumentInfo result = createOrFindFile(remotePath, fallbackName, replaceExisting);
+            claims.claimUri(result.uri.toString(), remotePath);
+            return result;
+        }
+
+        private void checkUnclaimed(DocumentInfo target, String remotePath) throws Exception {
+            if (target != null) claims.checkUri(target.uri.toString(), remotePath);
+        }
+
+        private DocumentInfo createOrFindFile(String remotePath, String fallbackName, boolean replaceExisting) throws Exception {
             if (treeUri == null) {
                 return ensurePublicFile(remotePath, fallbackName, replaceExisting);
             }
@@ -1301,11 +1439,13 @@ final class HttpReceiver {
             if (!replaceExisting) {
                 DocumentInfo remembered = rememberedTarget(remotePath);
                 if (remembered != null) {
+                    checkUnclaimed(remembered, remotePath);
                     return remembered;
                 }
             }
             Uri parent = ensureTreeDirectory(parentPath(parts));
             DocumentInfo existing = treeChild(parent, name);
+            checkUnclaimed(existing, remotePath);
             if (existing != null && replaceExisting) {
                 DocumentsContract.deleteDocument(resolver, existing.uri);
                 treeChildren(parent).remove(name);
@@ -1325,7 +1465,7 @@ final class HttpReceiver {
             return info;
         }
 
-        Uri ensureDirectory(String remotePath) throws Exception {
+        synchronized Uri ensureDirectory(String remotePath) throws Exception {
             if (treeUri == null) {
                 ensurePublicDownloadDirectory(remotePath);
                 return null;
@@ -1411,6 +1551,7 @@ final class HttpReceiver {
                 if (replaceExisting) {
                     DocumentInfo existing = files.get(name);
                     if (existing != null) {
+                        checkUnclaimed(existing, remotePath);
                         resolver.delete(existing.uri, null, null);
                         files.remove(name);
                     }
@@ -1421,12 +1562,14 @@ final class HttpReceiver {
                     // scoped-storage hiding a same-named file made by another app.
                     DocumentInfo remembered = rememberedTarget(remotePath);
                     if (remembered != null) {
+                        checkUnclaimed(remembered, remotePath);
                         return remembered;
                     }
                     // Fallback when no record exists yet (e.g. app data cleared): reuse our
                     // own plain name or a collision-renamed sibling, most-complete first.
                     DocumentInfo variant = bestResumeVariant(files, name);
                     if (variant != null) {
+                        checkUnclaimed(variant, remotePath);
                         rememberTarget(remotePath, variant.uri);
                         return variant;
                     }
@@ -1523,16 +1666,23 @@ final class HttpReceiver {
 
     static final class Session {
         private volatile boolean stopped;
-        private volatile HttpURLConnection activeConnection;
+        private final Set<HttpURLConnection> activeConnections = new HashSet<>();
+        private ExecutorService executor;
+        final ReceiveTimings timings = new ReceiveTimings();
         private boolean terminated;
         private Runnable terminationListener;
 
         void stop() {
-            stopped = true;
-            HttpURLConnection conn = activeConnection;
-            if (conn != null) {
-                conn.disconnect();
+            List<HttpURLConnection> connections;
+            ExecutorService pool;
+            synchronized (this) {
+                stopped = true;
+                connections = new ArrayList<>(activeConnections);
+                activeConnections.clear();
+                pool = executor;
             }
+            if (pool != null) pool.shutdownNow();
+            for (HttpURLConnection conn : connections) disconnect(conn);
         }
 
         boolean isStopped() {
@@ -1569,23 +1719,43 @@ final class HttpReceiver {
         }
 
         void attach(HttpURLConnection conn) {
-            activeConnection = conn;
-            if (stopped && conn != null) {
-                conn.disconnect();
+            if (conn == null) return;
+            synchronized (this) {
+                if (!stopped) {
+                    activeConnections.add(conn);
+                    return;
+                }
             }
+            disconnect(conn);
         }
 
         void detach(HttpURLConnection conn) {
-            if (activeConnection == conn) {
-                activeConnection = null;
+            synchronized (this) {
+                activeConnections.remove(conn);
             }
-            if (conn != null) {
-                conn.disconnect();
+            if (conn != null) disconnect(conn);
+        }
+
+        void attachExecutor(ExecutorService pool) {
+            synchronized (this) {
+                executor = pool;
+                if (!stopped) return;
             }
+            pool.shutdownNow();
+        }
+
+        synchronized void detachExecutor(ExecutorService pool) {
+            if (executor == pool) executor = null;
+        }
+
+        private static void disconnect(HttpURLConnection conn) {
+            try { conn.disconnect(); } catch (RuntimeException ignored) { }
         }
     }
 
     private static final class ProgressClock {
+        long networkBytes;
+        long logicalBytes;
         private final long startMs = System.currentTimeMillis();
         private long lastMs = startMs;
         private long lastBytes;
@@ -1594,7 +1764,7 @@ final class HttpReceiver {
         boolean shouldEmit(long doneBytes) {
             long now = System.currentTimeMillis();
             long elapsed = now - lastMs;
-            if (elapsed < 1000 && doneBytes != lastBytes) {
+            if (elapsed < 200 && doneBytes != lastBytes) {
                 return false;
             }
             if (elapsed > 0) {

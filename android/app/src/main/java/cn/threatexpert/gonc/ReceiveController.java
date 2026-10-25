@@ -1921,6 +1921,15 @@ final class ReceiveController {
         DownloadTerminalHolder terminal = new DownloadTerminalHolder();
         HttpReceiver.Session startedDownload = HttpReceiver.start(context(), endpoint, saveTreeUri, files, resumeDownloads, new HttpReceiver.Callback() {
             @Override
+            public void onDiagnostic(String message) {
+                host.mainHandler().post(() -> {
+                    if (!shutdown && isCurrentRun(runId) && receiveDownloadId == downloadId) {
+                        host.log("info", message);
+                    }
+                });
+            }
+
+            @Override
             public void onProgress(int doneFiles, int totalFiles, long doneBytes, long totalBytes, long networkBytes, double bytesPerSecond, String current) {
                 queueDownloadProgress(runId, doneFiles, totalFiles, doneBytes, totalBytes, networkBytes, bytesPerSecond, current);
             }

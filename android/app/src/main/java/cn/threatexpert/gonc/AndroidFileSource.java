@@ -7,12 +7,14 @@ import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
+import android.util.Log;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
@@ -23,11 +25,14 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 final class AndroidFileSource implements mobilegonc.AndroidFileSource {
+    private static final String TAG = "GoncShareSource";
     private final ContentResolver resolver;
     private final Object rootsLock = new Object();
     private final List<Node> roots = new ArrayList<>();
     private final Map<Long, OpenHandle> streams = new HashMap<>();
     private final AtomicLong nextHandle = new AtomicLong(1);
+    private final AtomicLong directoryQueries = new AtomicLong();
+    private volatile boolean closed;
 
     AndroidFileSource(Context context, List<ShareItem> items) {
         this.resolver = context.getApplicationContext().getContentResolver();
@@ -43,7 +48,7 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
         }
         synchronized (rootsLock) {
             roots.clear();
-            roots.addAll(updated);
+            if (!closed) roots.addAll(updated);
         }
     }
 
@@ -54,49 +59,72 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
 
     @Override
     public String stat(String name) {
+        long started = System.nanoTime();
         try {
-            Node node = resolve(name);
-            return node == null ? "" : node.toJson().toString();
-        } catch (Exception ignored) {
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try {
+                    Node node = resolve(name, attempt > 0);
+                    return node == null ? "" : freshMetadata(node).toJson().toString();
+                } catch (Exception error) {
+                    if (attempt == 1) return "";
+                }
+            }
             return "";
+        } finally {
+            logSlow("stat", started);
         }
     }
 
     @Override
     public String readDir(String name) {
-        try {
-            Node node = resolve(name);
-            if (node == null || !node.directory) {
-                return "";
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                Node node = resolve(name, attempt > 0);
+                if (node == null || !node.directory) return "";
+                JSONArray array = new JSONArray();
+                for (Node child : node.refreshChildren()) array.put(child.toJson());
+                return array.toString();
+            } catch (Exception error) {
+                if (attempt == 1) return "";
             }
-            JSONArray array = new JSONArray();
-            for (Node child : node.children()) {
-                array.put(child.toJson());
-            }
-            return array.toString();
-        } catch (Exception ignored) {
-            return "";
         }
+        return "";
     }
 
     @Override
     public long open(String name) {
+        long started = System.nanoTime();
         try {
-            Node node = resolve(name);
-            if (node == null || node.directory) {
-                return 0;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try {
+                    Node node = resolve(name, attempt > 0);
+                    if (node == null || node.directory) return 0;
+                    // Check the one document, including rename, without enumerating its siblings.
+                    freshMetadata(node);
+                    long openStarted = System.nanoTime();
+                    OpenHandle openHandle;
+                    try {
+                        openHandle = OpenHandle.open(resolver, node.uri);
+                    } finally {
+                        logSlow("open file", openStarted);
+                    }
+                    if (openHandle == null) throw new FileNotFoundException(name);
+                    synchronized (streams) {
+                        if (closed) {
+                            openHandle.close();
+                            return 0;
+                        }
+                        long handle = nextHandle.getAndIncrement();
+                        streams.put(handle, openHandle);
+                        return handle;
+                    }
+                } catch (Exception error) {
+                    if (attempt == 1) return 0;
+                }
             }
-            OpenHandle openHandle = OpenHandle.open(resolver, node.uri);
-            if (openHandle == null) {
-                return 0;
-            }
-            long handle = nextHandle.getAndIncrement();
-            synchronized (streams) {
-                streams.put(handle, openHandle);
-            }
-            return handle;
-        } catch (Exception ignored) {
             return 0;
+        } finally {
+            logSlow("open", started);
         }
     }
 
@@ -157,19 +185,24 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
     void closeAll() {
         List<Long> handles;
         synchronized (streams) {
+            closed = true;
             handles = new ArrayList<>(streams.keySet());
+        }
+        synchronized (rootsLock) {
+            roots.clear(); // Releases all directory indexes with the sharing session.
         }
         for (Long handle : handles) {
             close(handle);
         }
     }
 
-    private Node resolve(String name) throws Exception {
+    private Node resolve(String name, boolean refresh) throws Exception {
+        if (closed) return null;
         String clean = cleanPath(name);
         if ("/".equals(clean)) {
             return new Node("/", null, true, 0, DocumentsContract.Document.MIME_TYPE_DIR, 0, false) {
                 @Override
-                List<Node> children() {
+                List<Node> refreshChildren() {
                     return rootSnapshot();
                 }
             };
@@ -189,14 +222,7 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
             if (!current.directory) {
                 return null;
             }
-            Node next = null;
-            for (Node child : current.children()) {
-                if (child.name.equals(parts[i])) {
-                    next = child;
-                    break;
-                }
-            }
-            current = next;
+            current = current.index.find(parts[i], refresh);
             if (current == null) {
                 return null;
             }
@@ -238,8 +264,15 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
         final String mimeType;
         final long lastModifiedMillis;
         final boolean treeUri;
+        final String documentName;
+        final ShareDirectoryIndex<Node> index = new ShareDirectoryIndex<>(
+                () -> loadChildren(this), node -> node.name);
 
         Node(String name, Uri uri, boolean directory, long size, String mimeType, long lastModifiedMillis, boolean treeUri) {
+            this(name, uri, directory, size, mimeType, lastModifiedMillis, treeUri, null);
+        }
+
+        Node(String name, Uri uri, boolean directory, long size, String mimeType, long lastModifiedMillis, boolean treeUri, String documentName) {
             this.name = name;
             this.uri = uri;
             this.directory = directory;
@@ -247,6 +280,7 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
             this.mimeType = mimeType == null ? "application/octet-stream" : mimeType;
             this.lastModifiedMillis = lastModifiedMillis;
             this.treeUri = treeUri;
+            this.documentName = documentName;
         }
 
         JSONObject toJson() throws Exception {
@@ -258,15 +292,16 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
             return object;
         }
 
-        List<Node> children() throws Exception {
+        List<Node> refreshChildren() throws Exception {
             if (!directory) {
                 return new ArrayList<>();
             }
-            return loadChildren(this);
+            return index.refresh();
         }
     }
 
     private List<Node> loadChildren(Node parent) throws Exception {
+        long started = System.nanoTime();
         List<Node> out = new ArrayList<>();
         if (parent.uri == null) {
             return out;
@@ -286,7 +321,7 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
                 DocumentsContract.Document.COLUMN_LAST_MODIFIED
         }, null, null, null);
         if (cursor == null) {
-            return out;
+            throw new FileNotFoundException("Cannot query shared directory");
         }
         Map<String, Integer> seen = new LinkedHashMap<>();
         try {
@@ -298,12 +333,65 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
                 long lastModified = cursor.isNull(4) ? 0 : cursor.getLong(4);
                 boolean isDir = DocumentsContract.Document.MIME_TYPE_DIR.equals(mimeType);
                 Uri childUri = DocumentsContract.buildDocumentUriUsingTree(parent.uri, docId);
-                out.add(new Node(uniqueName(safeName(displayName), seen), childUri, isDir, size, mimeType, lastModified, false));
+                out.add(new Node(uniqueName(safeName(displayName), seen), childUri, isDir, size, mimeType, lastModified, false, displayName));
             }
         } finally {
             cursor.close();
+            Log.d(TAG, "directory query #" + directoryQueries.incrementAndGet()
+                    + " entries=" + out.size() + " elapsedMs=" + elapsedMs(started));
         }
         return out;
+    }
+
+    private Node freshMetadata(Node node) throws Exception {
+        long started = System.nanoTime();
+        try {
+            return queryMetadata(node);
+        } finally {
+            logSlow("metadata query", started);
+        }
+    }
+
+    private Node queryMetadata(Node node) throws Exception {
+        if (node.uri == null) return node;
+        if ("file".equalsIgnoreCase(node.uri.getScheme())) {
+            File file = new File(node.uri.getPath());
+            if (!file.exists()) throw new FileNotFoundException(node.name);
+            return new Node(node.name, node.uri, file.isDirectory(), file.length(),
+                    node.mimeType, file.lastModified(), false, node.documentName);
+        }
+        Uri queryUri = node.treeUri ? DocumentsContract.buildDocumentUriUsingTree(
+                node.uri, DocumentsContract.getTreeDocumentId(node.uri)) : node.uri;
+        // Query only this document. Optional columns vary across Documents/Media providers.
+        try (Cursor cursor = resolver.query(queryUri, null, null, null, null)) {
+            if (cursor == null || !cursor.moveToFirst()) throw new FileNotFoundException(node.name);
+            int nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+            if (node.documentName != null && nameColumn >= 0
+                    && !node.documentName.equals(cursor.getString(nameColumn))) {
+                throw new FileNotFoundException("Shared document was renamed");
+            }
+            int sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE);
+            long size = sizeColumn < 0 || cursor.isNull(sizeColumn) ? -1 : cursor.getLong(sizeColumn);
+            int modifiedColumn = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
+            long modified = 0;
+            if (modifiedColumn >= 0 && !cursor.isNull(modifiedColumn)) {
+                modified = cursor.getLong(modifiedColumn);
+            } else {
+                int secondsColumn = cursor.getColumnIndex("date_modified");
+                if (secondsColumn >= 0 && !cursor.isNull(secondsColumn)) modified = cursor.getLong(secondsColumn) * 1000L;
+            }
+            return new Node(node.name, node.uri, node.directory, size, node.mimeType,
+                    modified, node.treeUri, node.documentName);
+        }
+    }
+
+    private static long elapsedMs(long started) {
+        return (System.nanoTime() - started) / 1_000_000L;
+    }
+
+    private static void logSlow(String operation, long started) {
+        long elapsed = elapsedMs(started);
+        if (elapsed >= 100) Log.d(TAG, operation + " elapsedMs=" + elapsed);
     }
 
     private static String safeName(String value) {
@@ -321,11 +409,14 @@ final class AndroidFileSource implements mobilegonc.AndroidFileSource {
             return base;
         }
         int next = count + 1;
-        seen.put(base, next);
         int dot = base.lastIndexOf('.');
         String stem = dot > 0 ? base.substring(0, dot) : base;
         String ext = dot > 0 ? base.substring(dot) : "";
-        return stem + "-" + next + ext;
+        String candidate = stem + "-" + next + ext;
+        while (seen.containsKey(candidate)) candidate = stem + "-" + (++next) + ext;
+        seen.put(base, next);
+        seen.put(candidate, 1);
+        return candidate;
     }
 
     private static final class OpenHandle {
