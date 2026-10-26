@@ -30,6 +30,7 @@ import com.journeyapps.barcodescanner.DecoratedBarcodeView;
 import java.io.InputStream;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 
@@ -44,6 +45,7 @@ public final class QrScanActivity extends Activity {
 
     private DecoratedBarcodeView barcodeView;
     private boolean completed;
+    private final EnumSet<BarcodeFormat> loggedRejectedFormats = EnumSet.noneOf(BarcodeFormat.class);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,6 +53,9 @@ public final class QrScanActivity extends Activity {
 
         FrameLayout root = new FrameLayout(this);
         barcodeView = new DecoratedBarcodeView(this);
+        // This custom activity does not call initializeFromIntent: intent QR_CODE_MODE
+        // alone does not constrain the camera decoder. Apply the format explicitly.
+        barcodeView.setDecoderFactory(QrScanPolicy.decoderFactory());
         String prompt = getIntent() == null ? null : getIntent().getStringExtra(Intents.Scan.PROMPT_MESSAGE);
         if (prompt != null && !prompt.trim().isEmpty()) {
             barcodeView.setStatusText(prompt);
@@ -58,9 +63,17 @@ public final class QrScanActivity extends Activity {
         barcodeView.decodeContinuous(new BarcodeCallback() {
             @Override
             public void barcodeResult(BarcodeResult result) {
-                if (result != null && result.getText() != null) {
-                    complete(result.getText());
+                if (completed || result == null) return;
+                if (!QrScanPolicy.accepts(result.getBarcodeFormat(), result.getText())) {
+                    // Log only the format, once per scan session; never log payloads.
+                    BarcodeFormat format = result.getBarcodeFormat();
+                    if (format != null && loggedRejectedFormats.add(format)) {
+                        GoncCrashReporter.appendLog(QrScanActivity.this, "warn",
+                                "QR scan rejected: source=camera format=" + format);
+                    }
+                    return; // Keep scanning rather than accepting another barcode format.
                 }
+                complete(result.getText(), "camera");
             }
         });
         root.addView(barcodeView, new FrameLayout.LayoutParams(
@@ -120,7 +133,7 @@ public final class QrScanActivity extends Activity {
             }
             String result = decodeBitmap(normalizeBitmap(bitmap));
             if (result != null) {
-                complete(result);
+                complete(result, "album");
                 return;
             }
             Toast.makeText(this, R.string.toast_qr_not_found, Toast.LENGTH_SHORT).show();
@@ -341,11 +354,13 @@ public final class QrScanActivity extends Activity {
         return options;
     }
 
-    private void complete(String value) {
+    private void complete(String value, String source) {
         if (completed || value == null || value.trim().isEmpty()) {
             return;
         }
         completed = true;
+        GoncCrashReporter.appendLog(this, "info",
+                "QR scan accepted: source=" + source + " format=QR_CODE");
         Intent data = new Intent();
         data.putExtra(Intents.Scan.RESULT, value);
         setResult(RESULT_OK, data);

@@ -714,6 +714,7 @@ final class VpnClientController {
     private void handleVpnQr(String value) {
         if (GoncVpnState.isRunning()) return;
         VpnQrPayload payload = VpnQrPayload.parse(value);
+        host.log("info", "VPN QR classification=" + payload.kind);
         if (payload.kind == VpnQrPayload.Kind.PASSPHRASE) {
             currentProfile().passphrase = payload.passphrase;
             passwordVisible = false;
